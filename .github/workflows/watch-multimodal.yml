@@ -1,0 +1,72 @@
+name: Watch multimodal biomedical papers
+
+# NOTE: this workflow runs on the "tooling" branch (the fork's default
+# branch). It keeps its own copy of multimodal.md fresh by merging in
+# "main" first, then writes new candidates to candidates/watchlist.md on
+# "tooling" — never touching "main".
+
+on:
+  schedule:
+    # Every Monday 09:00 UTC. Adjust to taste.
+    - cron: "0 9 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tooling
+        uses: actions/checkout@v4
+        with:
+          ref: tooling
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge latest main into tooling (fresh multimodal.md for dedup)
+        run: |
+          git fetch origin main
+          if git merge origin/main --no-edit; then
+            echo "OK: merged cleanly"
+          else
+            echo "::error::Merge conflict pulling main into tooling. Resolve manually."
+            git merge --abort
+            exit 1
+          fi
+          git push origin tooling
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Run watcher
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python scripts/watch_multimodal.py
+
+      - name: Open PR with new candidates (into tooling only, never main)
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "chore: update multimodal paper watchlist"
+          title: "New multimodal biomedical candidate papers"
+          body: |
+            Candidate papers found by the automated watcher this cycle.
+            Review `candidates/watchlist.md`, and for anything worth adding,
+            write a properly formatted entry for `multimodal.md` by hand on
+            a fresh branch off `main`, then open a PR against upstream from
+            that branch — never from `tooling`.
+          branch: auto/paper-watchlist
+          base: tooling
+          add-paths: candidates/watchlist.md
+          delete-branch: true
