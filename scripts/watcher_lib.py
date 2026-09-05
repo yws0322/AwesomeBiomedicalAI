@@ -17,6 +17,13 @@ import requests
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
 
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (compatible; multimodal-watch/1.0; "
+        "+https://github.com/medfm-flare/AwesomeBiomedicalAI)"
+    )
+}
+
 ARXIV_CATEGORIES = ["cs.CV", "cs.CL", "cs.LG", "q-bio.QM", "eess.IV"]
 ARXIV_KEYWORDS = ["multimodal", "vision-language", "foundation model"]
 ARXIV_DOMAIN_KEYWORDS = [
@@ -42,6 +49,8 @@ LOOKBACK_DAYS = 8
 
 def fetch_arxiv_candidates():
     import datetime
+    import time as time_module
+
     query_terms = [f'abs:"{kw}"' for kw in ARXIV_KEYWORDS]
     kw_query = "(" + " OR ".join(query_terms) + ")"
     domain_terms = [f'abs:"{kw}"' for kw in ARXIV_DOMAIN_KEYWORDS]
@@ -56,9 +65,23 @@ def fetch_arxiv_candidates():
         "sortOrder": "descending",
         "max_results": str(MAX_ARXIV_RESULTS),
     }
-    url = "http://export.arxiv.org/api/query?" + urllib.parse.urlencode(params)
-    with urllib.request.urlopen(url, timeout=30) as resp:
-        raw = resp.read()
+    url = "https://export.arxiv.org/api/query?" + urllib.parse.urlencode(params)
+
+    raw = None
+    last_error = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, headers=HTTP_HEADERS, timeout=60)
+            resp.raise_for_status()
+            raw = resp.content
+            break
+        except requests.RequestException as e:
+            last_error = e
+            print(f"  arXiv API attempt {attempt + 1}/3 failed: {e}")
+            time_module.sleep(5 * (attempt + 1))
+    if raw is None:
+        print(f"  arXiv API unreachable after 3 attempts, skipping arXiv this run: {last_error}")
+        return []
 
     ns = {"atom": "http://www.w3.org/2005/Atom"}
     root = ET.fromstring(raw)
@@ -86,12 +109,21 @@ def fetch_arxiv_candidates():
 
 def fetch_nature_family_candidates():
     import datetime
+    import socket
     cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=LOOKBACK_DAYS)
     all_keywords = [k.lower() for k in ARXIV_KEYWORDS + ARXIV_DOMAIN_KEYWORDS]
 
     candidates = []
     for journal, feed_url in NATURE_FAMILY_FEEDS.items():
-        parsed = feedparser.parse(feed_url)
+        try:
+            socket.setdefaulttimeout(30)
+            parsed = feedparser.parse(feed_url, agent=HTTP_HEADERS["User-Agent"])
+        except Exception as e:
+            print(f"  RSS fetch failed for {journal}: {e}")
+            continue
+        if getattr(parsed, "bozo", False) and not getattr(parsed, "entries", None):
+            print(f"  RSS parse issue for {journal}: {parsed.get('bozo_exception')}")
+            continue
         for entry in parsed.entries:
             title = getattr(entry, "title", "")
             summary = getattr(entry, "summary", "")
