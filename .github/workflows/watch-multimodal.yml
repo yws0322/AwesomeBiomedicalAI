@@ -78,6 +78,7 @@ jobs:
         id: run
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: claude-haiku-4-5-20251001
         run: python scripts/screen.py --in candidates.json --out accepted.json
 
       - uses: actions/upload-artifact@v4
