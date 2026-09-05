@@ -42,6 +42,8 @@ def main():
     if gh_output:
         with open(gh_output, "a") as f:
             f.write(f"has_accepted={'true' if accepted else 'false'}\n")
+            f.write(f"screened_count={len(candidates)}\n")
+            f.write(f"accepted_count={len(accepted)}\n")
 
 
 if __name__ == "__main__":

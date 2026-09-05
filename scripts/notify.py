@@ -15,13 +15,19 @@ import json
 import os
 
 
-def build_email(accepted):
+def build_email(accepted, raw_count, new_count, screened_count):
     today = datetime.date.today().isoformat()
     subject = f"[multimodal.md watch] {len(accepted)} new candidate paper(s) \u2014 {today}"
 
     lines = [
-        f"{len(accepted)} new candidate paper(s) found for multimodal.md ({today}).",
-        "Paste this list into Claude Code and ask it to read each paper, draft an",
+        f"multimodal.md watcher run \u2014 {today}",
+        "",
+        f"Raw hits from arXiv + Nature-family RSS: {raw_count}",
+        f"New (not already in multimodal.md or previously notified): {new_count}",
+        f"Screened by Claude: {screened_count}",
+        f"Passed screening: {len(accepted)}",
+        "",
+        "Paste the list below into Claude Code and ask it to read each paper, draft an",
         "entry in multimodal.md's format, and open a PR when you're happy with it.",
         "",
     ]
@@ -33,6 +39,9 @@ def build_email(accepted):
         lines.append(f"  Why: {verdict['reason']}")
         lines.append("")
 
+    if not accepted:
+        lines.append("(No candidates passed screening this run.)")
+
     return subject, "\n".join(lines)
 
 
@@ -42,12 +51,15 @@ def main():
     parser.add_argument("--seen-file", required=True)
     parser.add_argument("--subject-out", required=True)
     parser.add_argument("--body-out", required=True)
+    parser.add_argument("--raw-count", type=int, default=0)
+    parser.add_argument("--new-count", type=int, default=0)
+    parser.add_argument("--screened-count", type=int, default=0)
     args = parser.parse_args()
 
     with open(args.in_path, "r", encoding="utf-8") as f:
         accepted = json.load(f)
 
-    subject, body = build_email(accepted)
+    subject, body = build_email(accepted, args.raw_count, args.new_count, args.screened_count)
     with open(args.subject_out, "w", encoding="utf-8") as f:
         f.write(subject)
     with open(args.body_out, "w", encoding="utf-8") as f:

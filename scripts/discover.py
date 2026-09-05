@@ -35,17 +35,19 @@ def main():
             seen |= set(json.load(f))
 
     raw_candidates = lib.fetch_arxiv_candidates() + lib.fetch_nature_family_candidates()
-    fresh = lib.dedupe(raw_candidates, seen)
+    fresh_candidates = lib.dedupe(raw_candidates, seen)
 
-    print(f"Collected: {len(raw_candidates)} / New candidates: {len(fresh)}")
+    print(f"Collected: {len(raw_candidates)} / New candidates: {len(fresh_candidates)}")
     with open(args.out, "w", encoding="utf-8") as f:
-        json.dump(fresh, f, ensure_ascii=False, indent=2)
+        json.dump(fresh_candidates, f, ensure_ascii=False, indent=2)
 
-    # Job output so the workflow can skip downstream stages when there's nothing new.
+    # Job outputs so the workflow can skip downstream stages and pass stats along.
     gh_output = os.environ.get("GITHUB_OUTPUT")
     if gh_output:
         with open(gh_output, "a") as f:
-            f.write(f"has_candidates={'true' if fresh else 'false'}\n")
+            f.write(f"has_candidates={'true' if fresh_candidates else 'false'}\n")
+            f.write(f"raw_count={len(raw_candidates)}\n")
+            f.write(f"new_count={len(fresh_candidates)}\n")
 
 
 if __name__ == "__main__":
