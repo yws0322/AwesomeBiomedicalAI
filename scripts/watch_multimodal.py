@@ -7,15 +7,23 @@ multimodal.md candidate paper watcher
 3) Skip anything already surfaced before (tracked in candidates/watchlist.md).
 4) Send the remaining candidates to the Claude API and ask "does this fit the
    repo's scope for a multimodal biomedical AI paper?"
-5) Only candidates that pass get appended to candidates/watchlist.md.
+5) For anything that passes, try to fetch the full text (arXiv PDF, the
+   publisher's own HTML page for open-access journals, or a PubMed Central
+   fallback) and have Claude draft a full multimodal.md-formatted entry from
+   whatever text was actually retrieved — never inventing numbers for fields
+   that aren't stated in the source text.
+6) Both the short listing and the draft entry get appended to
+   candidates/watchlist.md.
 
-This script never edits multimodal.md directly. Writing the actual, fully
-detailed entry (backbone, pre-training scheme, benchmark numbers, etc.) and
-opening the PR against medfm-flare/AwesomeBiomedicalAI is left to a human.
+This script never edits multimodal.md directly, and never opens a PR against
+the upstream repo. A human still reviews every draft (especially any field
+NOT marked "—"/"Not disclosed") before copying it into multimodal.md and
+opening a PR from a clean branch off `main`.
 """
 
 import os
 import re
+import io
 import json
 import time
 import datetime
@@ -25,13 +33,34 @@ import xml.etree.ElementTree as ET
 
 import feedparser
 import requests
+from bs4 import BeautifulSoup
+from pypdf import PdfReader
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MULTIMODAL_MD = os.path.join(REPO_ROOT, "multimodal.md")
 WATCHLIST_MD = os.path.join(REPO_ROOT, "candidates", "watchlist.md")
 
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+# Cheap model for the yes/no screening step.
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
+# A stronger model is worth it for the drafting step, since it has to read a
+# full paper and format a detailed, numbers-heavy entry accurately.
+ANTHROPIC_DRAFT_MODEL = os.environ.get("ANTHROPIC_DRAFT_MODEL", "claude-sonnet-5")
+
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (compatible; multimodal-watch/1.0; "
+        "+https://github.com/medfm-flare/AwesomeBiomedicalAI)"
+    )
+}
+
+# Journals that are fully open access — full HTML text is expected to work.
+OPEN_ACCESS_JOURNALS = {
+    "Nature Communications",
+    "npj Digital Medicine",
+    "Signal Transduct. Target. Ther.",
+    "Cell Rep. Med.",
+}
 
 # ---- Search targets -------------------------------------------------------
 
@@ -228,17 +257,206 @@ def judge_with_claude(candidate):
         return {"relevant": False, "priority": "low", "reason": "Failed to parse the judge response"}
 
 
-# ---- 4. Write to watchlist.md ----------------------------------------------
+# ---- 4. Full-text retrieval -------------------------------------------------
+
+def _extract_readable_text(html):
+    """Best-effort extraction of the main article body from a journal HTML page."""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
+        tag.decompose()
+
+    # Springer Nature journals render the body in a <div class="c-article-body">;
+    # fall back to <article>, then to the whole page if neither is found.
+    body = soup.find("div", class_="c-article-body") or soup.find("article") or soup.body
+    if body is None:
+        return ""
+    text = body.get_text(separator="\n", strip=True)
+    return text
+
+
+def _fetch_arxiv_fulltext(arxiv_id):
+    pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
+    resp = requests.get(pdf_url, headers=HTTP_HEADERS, timeout=60)
+    resp.raise_for_status()
+    reader = PdfReader(io.BytesIO(resp.content))
+    pages = [page.extract_text() or "" for page in reader.pages]
+    return "\n".join(pages).strip()
+
+
+def _doi_to_pmcid(doi):
+    """Ask NCBI's ID converter whether this DOI has a PubMed Central copy."""
+    try:
+        resp = requests.get(
+            "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/",
+            params={"ids": doi, "format": "json", "tool": "multimodal-watch"},
+            headers=HTTP_HEADERS,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        records = resp.json().get("records", [])
+        if records and "pmcid" in records[0]:
+            return records[0]["pmcid"]
+    except (requests.RequestException, ValueError, KeyError, IndexError):
+        pass
+    return None
+
+
+def _fetch_pmc_fulltext(pmcid):
+    url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/"
+    resp = requests.get(url, headers=HTTP_HEADERS, timeout=30)
+    resp.raise_for_status()
+    return _extract_readable_text(resp.text)
+
+
+def fetch_full_text(candidate):
+    """
+    Try, in order: arXiv PDF -> the publisher's own HTML page -> PubMed
+    Central. Returns (text, source_label) where source_label describes what
+    was actually retrieved, or (None, None) if nothing worked.
+    """
+    if candidate["source"] == "arXiv":
+        try:
+            text = _fetch_arxiv_fulltext(candidate["id"])
+            if len(text) > 2000:
+                return text, "arXiv PDF (full text)"
+        except Exception as e:
+            print(f"    arXiv fetch failed: {e}")
+        return None, None
+
+    # Journal entries: try the publisher page directly first.
+    try:
+        resp = requests.get(candidate["link"], headers=HTTP_HEADERS, timeout=30)
+        resp.raise_for_status()
+        text = _extract_readable_text(resp.text)
+        # A paywalled teaser page is usually short; a real article body is not.
+        if len(text) > 3000:
+            return text, f"{candidate['source']} article page (full text)"
+    except Exception as e:
+        print(f"    Publisher page fetch failed: {e}")
+
+    # Fall back to PubMed Central if this DOI has a deposited copy.
+    doi_match = re.search(r"doi\.org/(\S+)$", candidate["link"])
+    if doi_match:
+        pmcid = _doi_to_pmcid(doi_match.group(1))
+        if pmcid:
+            try:
+                text = _fetch_pmc_fulltext(pmcid)
+                if len(text) > 3000:
+                    return text, f"PubMed Central {pmcid} (full text)"
+            except Exception as e:
+                print(f"    PMC fetch failed: {e}")
+
+    return None, None
+
+
+# ---- 5. Draft a full multimodal.md-formatted entry --------------------------
+
+DRAFT_SYSTEM_PROMPT = """\
+You draft candidate entries for the "AwesomeBiomedicalAI" repository's \
+multimodal.md file, in EXACTLY this format (this is one real example from \
+the file):
+
+**VirTues — The Virtual Tissues foundation model resolves spatial proteomics across scales *(Nature 202608)***
+
+**[The Virtual Tissues foundation model resolves spatial proteomics across scales](https://doi.org/10.1038/s41586-026-10884-y)**
+
+*Nature* · 202608 · [Author One](scholar-link) & [Author Two](scholar-link) · [doi:...](https://doi.org/...)
+
+| | |
+|---|---|
+| **Parameters** | ... |
+| **Backbone** | ... |
+| **Pre-training** | category   One sentence of specifics. |
+| **Training data** | description   key numbers |
+| **Downstream tasks** | comma list   One sentence of specifics. |
+| **Modalities** | ... |
+| **Code** | [github.com/...](...) |
+| **Weights** | ... |
+| **License** | ... |
+
+**Reported performance**
+
+| Benchmark | Metric | Value | Note |
+|---|---|---|---|
+| ... | ... | ... | ... |
+
+CRITICAL RULES:
+- Only state a fact if it is explicitly present in the text you were given below. \
+Never estimate, infer, or invent a parameter count, benchmark number, dataset \
+size, or architecture detail.
+- If a field is not stated in the text, write exactly "Not disclosed" (for \
+Parameters/Backbone/etc.) or "—" (for table cells), matching this repo's own \
+convention: "A dash (—) means the value has not been confirmed from the paper \
+or an official release."
+- Omit the Code/Weights/License rows entirely if no link or statement about \
+them appears in the text — do not guess a GitHub URL.
+- If you were only given an abstract (not the full paper), most detail fields \
+will legitimately be "Not disclosed" — that's expected and correct, not a \
+failure. Say so plainly rather than padding the entry.
+- Keep the "Pre-training" and "Downstream tasks" cells in this repo's style: \
+a short category/list on its own line, then one sentence of specifics below it.
+- Output ONLY the markdown entry. No preamble, no closing remarks.
+"""
+
+
+def draft_entry_with_claude(candidate, text, text_source):
+    if text is None:
+        text = candidate["summary"]
+        text_source = "abstract/summary only (full text not retrievable)"
+
+    prompt = (
+        f"Source: {candidate['source']}\n"
+        f"Link: {candidate['link']}\n"
+        f"Text basis: {text_source}\n\n"
+        f"--- TEXT ---\n{text[:60000]}\n--- END TEXT ---\n"
+    )
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": ANTHROPIC_DRAFT_MODEL,
+            "max_tokens": 2000,
+            "system": DRAFT_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=120,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    draft_md = "".join(block.get("text", "") for block in data.get("content", []))
+    return draft_md.strip(), text_source
+
+
+# ---- 6. Write to watchlist.md ----------------------------------------------
 
 def append_to_watchlist(accepted):
     os.makedirs(os.path.dirname(WATCHLIST_MD), exist_ok=True)
     today = datetime.date.today().isoformat()
 
     lines = [f"\n## Auto-collected candidates — {today}\n"]
-    for c, verdict in accepted:
+    for c, verdict, draft_md, text_source in accepted:
         lines.append(f"- **[{c['title']}]({c['link']})** — {c['source']}, {c['date']}")
         lines.append(f"  - Priority: `{verdict['priority']}`")
         lines.append(f"  - Reason: {verdict['reason']}")
+        lines.append(f"  - Draft basis: {text_source}")
+        lines.append("")
+        lines.append(
+            "  > ⚠️ **AUTO-DRAFTED — verify every field before merging**, "
+            "especially anything not marked `—`/`Not disclosed`. Any field "
+            "not explicitly stated in the retrieved text should already say "
+            "so, but double-check numbers against the paper yourself."
+        )
+        lines.append("")
+        lines.append("  <details><summary>Draft entry (click to expand)</summary>\n")
+        lines.append("  ```markdown")
+        for draft_line in draft_md.splitlines():
+            lines.append(f"  {draft_line}")
+        lines.append("  ```")
+        lines.append("  </details>")
         lines.append("")
 
     header = (
@@ -274,11 +492,17 @@ def main():
     for c in fresh_candidates:
         verdict = judge_with_claude(c)
         time.sleep(1)  # rate limit headroom
-        if verdict.get("relevant"):
-            accepted.append((c, verdict))
-            print(f"  [ACCEPTED:{verdict.get('priority')}] {c['title']}")
-        else:
+        if not verdict.get("relevant"):
             print(f"  [rejected] {c['title']} — {verdict.get('reason', '')}")
+            continue
+
+        print(f"  [ACCEPTED:{verdict.get('priority')}] {c['title']}")
+        print("    Fetching full text...")
+        text, text_source = fetch_full_text(c)
+        print(f"    Basis for draft: {text_source or 'abstract only'}")
+        draft_md, text_source = draft_entry_with_claude(c, text, text_source)
+        time.sleep(1)
+        accepted.append((c, verdict, draft_md, text_source))
 
     if not accepted:
         print("No new candidates this run.")
